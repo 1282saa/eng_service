@@ -6,6 +6,7 @@ import 'learning_screen.dart';
 import 'upload_screen.dart';
 import 'playlist_list_screen.dart';
 import 'playlist_detail_screen.dart';
+import 'api_test_screen.dart'; // 새로 추가한 import
 import '../services/database_service.dart';
 import '../models/playlist_model.dart';
 
@@ -33,6 +34,17 @@ class _DashboardScreenState extends State<DashboardScreen> {
       appBar: AppBar(
         title: const Text('EnglishBoost'),
         actions: [
+          // API 테스트 버튼 추가
+          IconButton(
+            icon: const Icon(Icons.api),
+            tooltip: 'API 테스트',
+            onPressed: () {
+              Navigator.push(
+                context,
+                MaterialPageRoute(builder: (_) => const ApiTestScreen()),
+              );
+            },
+          ),
           IconButton(
             icon: const Icon(Icons.account_circle),
             onPressed: () {
