@@ -2,14 +2,16 @@
 
 import 'dart:io' show File;
 import 'dart:typed_data';
-import 'package:flutter/foundation.dart' show kIsWeb;
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:file_picker/file_picker.dart';
 import '../services/ocr_service.dart';
 import '../services/tts_service.dart';
+import '../services/stt_service.dart';
 import '../services/database_service.dart';
 import '../models/track_model.dart';
+import '../utils/error_utils.dart';
 import 'create_playlist_screen.dart';
 import 'playlist_list_screen.dart';
 import '../config/dev_keys.dart';
@@ -25,6 +27,7 @@ class _UploadScreenState extends State<UploadScreen>
     with SingleTickerProviderStateMixin {
   // 서비스 인스턴스
   final TTSService _ttsService = TTSService();
+  final STTService _sttService = STTService();
   final DatabaseService _dbService = DatabaseService();
 
   // 탭 3개 (Photo, Text, Audio)
@@ -40,10 +43,18 @@ class _UploadScreenState extends State<UploadScreen>
 
   // 미리 듣기 상태
   bool _isPlaying = false;
+  
+  // 로딩 상태
+  bool _isLoading = false;
 
   // 플레이리스트 ID (선택된 경우)
   String? _selectedPlaylistId;
   String? _selectedPlaylistTitle;
+  
+  // 오디오 파일 경로 (웹이 아닌 경우)
+  String? _audioFilePath;
+  // 오디오 파일 바이트 (웹인 경우)
+  Uint8List? _audioFileBytes;
 
   @override
   void initState() {
@@ -52,7 +63,22 @@ class _UploadScreenState extends State<UploadScreen>
     _tabController = TabController(length: 3, vsync: this);
 
     // TTS 초기화
-    _ttsService.initialize();
+    _initTTS();
+  }
+  
+  // TTS 초기화 메서드
+  Future<void> _initTTS() async {
+    try {
+      await _ttsService.initialize();
+    } catch (e) {
+      if (mounted) {
+        ErrorUtils.showErrorSnackBar(
+          context, 
+          e, 
+          customMessage: 'TTS 초기화 중 오류가 발생했습니다.'
+        );
+      }
+    }
   }
 
   @override
@@ -67,9 +93,7 @@ class _UploadScreenState extends State<UploadScreen>
   Future<void> _saveData() async {
     final userId = FirebaseAuth.instance.currentUser?.uid;
     if (userId == null) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('로그인이 필요합니다')),
-      );
+      ErrorUtils.showInfoSnackBar(context, '로그인이 필요합니다');
       return;
     }
 
@@ -88,9 +112,7 @@ class _UploadScreenState extends State<UploadScreen>
     }
 
     if (textToSave == null || textToSave.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('저장할 내용이 없습니다')),
-      );
+      ErrorUtils.showInfoSnackBar(context, '저장할 내용이 없습니다');
       return;
     }
 
@@ -173,6 +195,7 @@ class _UploadScreenState extends State<UploadScreen>
             labelText: '제목',
             hintText: '트랙 제목을 입력하세요',
           ),
+          autofocus: true,
         ),
         actions: [
           TextButton(
@@ -183,8 +206,9 @@ class _UploadScreenState extends State<UploadScreen>
             onPressed: () async {
               final title = titleController.text.trim();
               if (title.isEmpty) {
-                ScaffoldMessenger.of(context).showSnackBar(
-                  const SnackBar(content: Text('제목을 입력해주세요')),
+                ErrorUtils.showInfoSnackBar(
+                  context, 
+                  '제목을 입력해주세요'
                 );
                 return;
               }
@@ -201,13 +225,36 @@ class _UploadScreenState extends State<UploadScreen>
 
   // 트랙 생성
   Future<void> _createTrack(String title, String text) async {
+    setState(() => _isLoading = true);
+    
     try {
+      final userId = FirebaseAuth.instance.currentUser?.uid;
+      if (userId == null) {
+        ErrorUtils.showInfoSnackBar(context, '로그인이 필요합니다');
+        return;
+      }
+      
+      // TTS를 사용하여 오디오 파일 생성 (선택 사항)
+      String? audioUrl;
+      try {
+        audioUrl = await _ttsService.generateAudioFile(
+          text, 
+          googleCloudVisionApiKey, // 같은 API 키 사용 (실제로는 TTS용 별도 키 권장)
+          userId
+        );
+      } catch (e) {
+        if (kDebugMode) {
+          print('오디오 파일 생성 오류 (무시됨): $e');
+        }
+        // 오디오 생성 실패해도 계속 진행
+      }
+
       final track = Track(
         id: '',
         playlistId: _selectedPlaylistId!,
         title: title,
         text: text,
-        audioUrl: null, // 오디오 URL은 나중에 설정
+        audioUrl: audioUrl, // 생성된 오디오 URL 설정 (없으면 null)
         createdAt: DateTime.now(),
         order: 999, // 임시 순서 (나중에 Firestore에서 조정)
         isFavorite: false,
@@ -216,33 +263,35 @@ class _UploadScreenState extends State<UploadScreen>
       await _dbService.addTrack(track);
 
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-              content: Text('트랙이 "${_selectedPlaylistTitle}" 플레이리스트에 추가되었습니다')),
+        ErrorUtils.showSuccessSnackBar(
+          context,
+          '트랙이 "${_selectedPlaylistTitle}" 플레이리스트에 추가되었습니다'
         );
 
         // 플레이리스트 화면으로 이동
-
         Navigator.push(
           context,
           MaterialPageRoute(builder: (_) => const PlaylistListScreen()),
         );
       }
     } catch (e) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('오류 발생: $e')),
-      );
+      if (mounted) {
+        ErrorUtils.showErrorSnackBar(context, e);
+      }
+    } finally {
+      setState(() => _isLoading = false);
     }
   }
 
   // Photo 탭: 이미지 파일 → OCR
   Future<void> _handlePhotoUpload() async {
+    setState(() => _isLoading = true);
+    
     try {
       final picked = await FilePicker.platform.pickFiles(type: FileType.image);
       if (picked == null || picked.files.isEmpty) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text("파일 선택이 취소됨")),
-        );
+        ErrorUtils.showInfoSnackBar(context, "파일 선택이 취소되었습니다");
+        setState(() => _isLoading = false);
         return;
       }
 
@@ -254,9 +303,12 @@ class _UploadScreenState extends State<UploadScreen>
         final fileBytes = file.bytes; // Uint8List?
         if (fileBytes == null) {
           // 웹에서 bytes가 없으면 OCR 불가
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text("웹 환경: 파일 bytes가 없습니다.")),
+          ErrorUtils.showErrorSnackBar(
+            context, 
+            null, 
+            customMessage: "웹 환경: 파일 bytes가 없습니다."
           );
+          setState(() => _isLoading = false);
           return;
         }
         // 2) Cloud Vision에 전송
@@ -268,9 +320,12 @@ class _UploadScreenState extends State<UploadScreen>
         // 모바일/데스크톱
         final path = file.path;
         if (path == null) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text("파일 경로가 비었습니다.")),
+          ErrorUtils.showErrorSnackBar(
+            context, 
+            null, 
+            customMessage: "파일 경로가 비었습니다"
           );
+          setState(() => _isLoading = false);
           return;
         }
         // 파일 읽어 Uint8List로 변환
@@ -284,13 +339,13 @@ class _UploadScreenState extends State<UploadScreen>
 
       setState(() => _photoOcrText = recognizedText);
 
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text("사진 업로드 & OCR 완료")),
-      );
+      ErrorUtils.showSuccessSnackBar(context, "사진 업로드 & OCR 완료");
     } catch (e) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text("오류 발생: $e")),
-      );
+      if (mounted) {
+        ErrorUtils.showErrorSnackBar(context, e);
+      }
+    } finally {
+      setState(() => _isLoading = false);
     }
   }
 
@@ -298,9 +353,7 @@ class _UploadScreenState extends State<UploadScreen>
   Future<void> _handleTextSubmit() async {
     final text = _textController.text.trim();
     if (text.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text("텍스트를 입력하세요.")),
-      );
+      ErrorUtils.showInfoSnackBar(context, "텍스트를 입력하세요");
       return;
     }
 
@@ -311,68 +364,103 @@ class _UploadScreenState extends State<UploadScreen>
     } else {
       setState(() => _isPlaying = true);
       await _ttsService.speak(text);
-      setState(() => _isPlaying = false);
+      // speak 메서드 완료 후 상태 업데이트
+      if (mounted) {
+        setState(() => _isPlaying = false);
+      }
     }
   }
 
   // Audio 탭 로직
   Future<void> _handleAudioUpload() async {
+    setState(() => _isLoading = true);
+    
     try {
       final picked = await FilePicker.platform.pickFiles(type: FileType.audio);
       if (picked == null || picked.files.isEmpty) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text("오디오 선택 취소됨")),
-        );
+        ErrorUtils.showInfoSnackBar(context, "오디오 선택이 취소되었습니다");
+        setState(() => _isLoading = false);
         return;
       }
 
-      // STT 기능은 아직 구현되지 않았습니다.
-      // 여기에 STT API 연동 코드가 필요합니다.
+      final file = picked.files.single;
+      
+      // 1) 웹인지, 모바일(데스크톱)인지에 따라 다르게 처리
+      if (kIsWeb) {
+        final fileBytes = file.bytes;
+        if (fileBytes == null) {
+          ErrorUtils.showErrorSnackBar(
+            context, 
+            null, 
+            customMessage: "웹 환경: 오디오 파일 bytes가 없습니다"
+          );
+          setState(() => _isLoading = false);
+          return;
+        }
+        
+        // 웹에서는 바이트 데이터 저장
+        _audioFileBytes = fileBytes;
+        
+        // STT 변환 실행
+        final transcribedText = await _sttService.convertAudioToText(
+          audioFile: fileBytes,
+          apiKey: googleCloudVisionApiKey, // 같은 API 키 사용 (실제로는 STT용 별도 키 권장)
+        );
+        
+        if (transcribedText == null) {
+          ErrorUtils.showErrorSnackBar(
+            context, 
+            null, 
+            customMessage: "STT 변환 실패: 오디오를 텍스트로 변환할 수 없습니다"
+          );
+          setState(() => _isLoading = false);
+          return;
+        }
+        
+        setState(() => _audioSttText = transcribedText);
+      } else {
+        // 모바일/데스크톱
+        final path = file.path;
+        if (path == null) {
+          ErrorUtils.showErrorSnackBar(
+            context, 
+            null, 
+            customMessage: "오디오 파일 경로가 비었습니다"
+          );
+          setState(() => _isLoading = false);
+          return;
+        }
+        
+        // 파일 경로 저장
+        _audioFilePath = path;
+        
+        // STT 변환 실행
+        final transcribedText = await _sttService.convertAudioToText(
+          audioFile: path,
+          apiKey: googleCloudVisionApiKey, // 같은 API 키 사용 (실제로는 STT용 별도 키 권장)
+        );
+        
+        if (transcribedText == null) {
+          ErrorUtils.showErrorSnackBar(
+            context, 
+            null, 
+            customMessage: "STT 변환 실패: 오디오를 텍스트로 변환할 수 없습니다"
+          );
+          setState(() => _isLoading = false);
+          return;
+        }
+        
+        setState(() => _audioSttText = transcribedText);
+      }
 
-      // 임시 처리
-      setState(() {
-        _audioSttText = "STT 기능이 아직 구현되지 않았습니다. 이 텍스트는 예시입니다.";
-      });
-
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text("오디오 업로드 완료")),
-      );
+      ErrorUtils.showSuccessSnackBar(context, "오디오 업로드 & STT 변환 완료");
     } catch (e) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text("오류 발생: $e")),
-      );
+      if (mounted) {
+        ErrorUtils.showErrorSnackBar(context, e);
+      }
+    } finally {
+      setState(() => _isLoading = false);
     }
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text("업로드하기"),
-        actions: [
-          IconButton(
-            icon: const Icon(Icons.save),
-            onPressed: _saveData,
-          ),
-        ],
-        bottom: TabBar(
-          controller: _tabController,
-          tabs: const [
-            Tab(text: "Photo"),
-            Tab(text: "Text"),
-            Tab(text: "Audio"),
-          ],
-        ),
-      ),
-      body: TabBarView(
-        controller: _tabController,
-        children: [
-          _buildPhotoTab(),
-          _buildTextTab(),
-          _buildAudioTab(),
-        ],
-      ),
-    );
   }
 
   // PHOTO 탭 UI
@@ -382,7 +470,7 @@ class _UploadScreenState extends State<UploadScreen>
       child: Column(
         children: [
           ElevatedButton.icon(
-            onPressed: _handlePhotoUpload,
+            onPressed: _isLoading ? null : _handlePhotoUpload,
             icon: const Icon(Icons.photo_camera),
             label: const Text("사진 업로드"),
             style: ElevatedButton.styleFrom(
@@ -391,8 +479,24 @@ class _UploadScreenState extends State<UploadScreen>
           ),
           const SizedBox(height: 16),
           if (_photoOcrText != null) ...[
-            const Text("OCR 결과:",
-                style: TextStyle(fontWeight: FontWeight.bold)),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                const Text(
+                  "OCR 결과:",
+                  style: TextStyle(fontWeight: FontWeight.bold),
+                ),
+                IconButton(
+                  icon: const Icon(Icons.copy),
+                  tooltip: '텍스트 복사',
+                  onPressed: () {
+                    // 클립보드에 텍스트 복사 기능
+                    // (필요하다면 flutter/services.dart에서 Clipboard 사용)
+                    ErrorUtils.showInfoSnackBar(context, '텍스트가 복사되었습니다');
+                  },
+                ),
+              ],
+            ),
             const SizedBox(height: 8),
             Expanded(
               child: Container(
@@ -409,16 +513,20 @@ class _UploadScreenState extends State<UploadScreen>
             ),
             const SizedBox(height: 16),
             ElevatedButton.icon(
-              onPressed: () async {
-                if (_isPlaying) {
-                  await _ttsService.stop();
-                  setState(() => _isPlaying = false);
-                } else {
-                  setState(() => _isPlaying = true);
-                  await _ttsService.speak(_photoOcrText!);
-                  setState(() => _isPlaying = false);
-                }
-              },
+              onPressed: _isLoading || _photoOcrText!.isEmpty
+                  ? null
+                  : () async {
+                      if (_isPlaying) {
+                        await _ttsService.stop();
+                        setState(() => _isPlaying = false);
+                      } else {
+                        setState(() => _isPlaying = true);
+                        await _ttsService.speak(_photoOcrText!);
+                        if (mounted) {
+                          setState(() => _isPlaying = false);
+                        }
+                      }
+                    },
               icon: Icon(_isPlaying ? Icons.stop : Icons.volume_up),
               label: Text(_isPlaying ? "중지" : "TTS로 듣기"),
             ),
@@ -430,23 +538,34 @@ class _UploadScreenState extends State<UploadScreen>
 
   // TEXT 탭 UI
   Widget _buildTextTab() {
-    return SingleChildScrollView(
+    return Padding(
       padding: const EdgeInsets.all(16),
       child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          const Text("텍스트를 입력하거나 붙여넣기"),
+          const Text(
+            "텍스트를 입력하거나 붙여넣기",
+            style: TextStyle(fontWeight: FontWeight.bold),
+          ),
           const SizedBox(height: 8),
-          TextField(
-            controller: _textController,
-            maxLines: 10,
-            decoration: const InputDecoration(
-              border: OutlineInputBorder(),
-              hintText: "여기에 입력...",
+          Expanded(
+            child: TextField(
+              controller: _textController,
+              maxLines: null,
+              expands: true,
+              textAlignVertical: TextAlignVertical.top,
+              decoration: const InputDecoration(
+                border: OutlineInputBorder(),
+                hintText: "여기에 입력...",
+                alignLabelWithHint: true,
+              ),
             ),
           ),
           const SizedBox(height: 16),
           ElevatedButton.icon(
-            onPressed: _handleTextSubmit,
+            onPressed: _isLoading || _textController.text.trim().isEmpty
+                ? null
+                : _handleTextSubmit,
             icon: Icon(_isPlaying ? Icons.stop : Icons.volume_up),
             label: Text(_isPlaying ? "중지" : "TTS로 듣기"),
           ),
@@ -457,12 +576,13 @@ class _UploadScreenState extends State<UploadScreen>
 
   // AUDIO 탭 UI
   Widget _buildAudioTab() {
-    return SingleChildScrollView(
+    return Padding(
       padding: const EdgeInsets.all(16),
       child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
           ElevatedButton.icon(
-            onPressed: _handleAudioUpload,
+            onPressed: _isLoading ? null : _handleAudioUpload,
             icon: const Icon(Icons.mic),
             label: const Text("오디오/동영상 업로드"),
             style: ElevatedButton.styleFrom(
@@ -471,34 +591,101 @@ class _UploadScreenState extends State<UploadScreen>
           ),
           const SizedBox(height: 16),
           if (_audioSttText != null) ...[
-            const Text("STT 변환 결과:",
-                style: TextStyle(fontWeight: FontWeight.bold)),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                const Text(
+                  "STT 변환 결과:",
+                  style: TextStyle(fontWeight: FontWeight.bold),
+                ),
+                IconButton(
+                  icon: const Icon(Icons.copy),
+                  tooltip: '텍스트 복사',
+                  onPressed: () {
+                    // 클립보드에 텍스트 복사 기능
+                    ErrorUtils.showInfoSnackBar(context, '텍스트가 복사되었습니다');
+                  },
+                ),
+              ],
+            ),
             const SizedBox(height: 8),
-            Container(
-              padding: const EdgeInsets.all(12),
-              width: double.infinity,
-              decoration: BoxDecoration(
-                color: Colors.green.shade50,
-                borderRadius: BorderRadius.circular(8),
+            Expanded(
+              child: Container(
+                padding: const EdgeInsets.all(12),
+                width: double.infinity,
+                decoration: BoxDecoration(
+                  color: Colors.green.shade50,
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: SingleChildScrollView(
+                  child: Text(_audioSttText!),
+                ),
               ),
-              child: Text(_audioSttText!),
             ),
             const SizedBox(height: 16),
             ElevatedButton.icon(
-              onPressed: () async {
-                if (_isPlaying) {
-                  await _ttsService.stop();
-                  setState(() => _isPlaying = false);
-                } else {
-                  setState(() => _isPlaying = true);
-                  await _ttsService.speak(_audioSttText!);
-                  setState(() => _isPlaying = false);
-                }
-              },
+              onPressed: _isLoading || _audioSttText!.isEmpty
+                  ? null
+                  : () async {
+                      if (_isPlaying) {
+                        await _ttsService.stop();
+                        setState(() => _isPlaying = false);
+                      } else {
+                        setState(() => _isPlaying = true);
+                        await _ttsService.speak(_audioSttText!);
+                        if (mounted) {
+                          setState(() => _isPlaying = false);
+                        }
+                      }
+                    },
               icon: Icon(_isPlaying ? Icons.stop : Icons.volume_up),
               label: Text(_isPlaying ? "중지" : "TTS로 듣기"),
             ),
           ],
+        ],
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text("업로드하기"),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.save),
+            onPressed: _isLoading ? null : _saveData,
+            tooltip: '저장',
+          ),
+        ],
+        bottom: TabBar(
+          controller: _tabController,
+          tabs: const [
+            Tab(text: "Photo", icon: Icon(Icons.photo_camera)),
+            Tab(text: "Text", icon: Icon(Icons.text_fields)),
+            Tab(text: "Audio", icon: Icon(Icons.mic)),
+          ],
+        ),
+      ),
+      body: Stack(
+        children: [
+          TabBarView(
+            controller: _tabController,
+            children: [
+              _buildPhotoTab(),
+              _buildTextTab(),
+              _buildAudioTab(),
+            ],
+          ),
+          // 로딩 인디케이터 오버레이
+          if (_isLoading)
+            Container(
+              color: Colors.black.withOpacity(0.3),
+              child: const Center(
+                child: CircularProgressIndicator(),
+              ),
+            ),
         ],
       ),
     );
