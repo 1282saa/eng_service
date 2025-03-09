@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "859297535236",
+    "project_id": "enlighlearn",
+    "storage_bucket": "enlighlearn.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:859297535236:android:f93150e4d733d3e1646c51",
+        "android_client_info": {
+          "package_name": "com.example.my_english_app"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyC7jeXw9LDQ4jb-TizL57YmGEewe9Km_rg"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
